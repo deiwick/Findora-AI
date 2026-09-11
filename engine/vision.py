@@ -1,392 +1,428 @@
+"""
+Findora AI - High-Performance Dual Camera Vision Engine (v5)
+
+Features:
+1. Rock-solid MJPEG stream parser for ESP32-CAM with automatic byte buffer synchronization.
+2. Fast, reliable OpenCV capture for Laptop Webcam using default MSMF backend.
+3. Isolated YOLOv8 models per camera zone (no ByteTrack state contamination).
+4. Continuous background inference dispatcher.
+5. Real-time overlay projection: bounding boxes & trails are drawn directly on every frame served to the browser.
+"""
 import os
 import cv2
 import time
+import urllib.request
 import numpy as np
 import threading
 import logging
+from datetime import datetime
 import config
 from engine.tracker import StationaryTracker
 
 logger = logging.getLogger(__name__)
 
+_TARGET_CLASSES = list(config.YOLO_CLASS_MAP.keys())
+_YOLO_IMGSZ = 416
+
+
+# ──────────────────────────────────────────────────────────
+# Robust MJPEG Stream Reader for ESP32-CAM
+# ──────────────────────────────────────────────────────────
+def _read_mjpeg_stream(url, frame_callback, stop_event, timeout=10.0):
+    """
+    Robust HTTP MJPEG stream reader with boundary search and byte buffer persistence.
+    Handles slow WiFi, variable frame rates, and chunked transfers cleanly.
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "FindoraAI/1.0"})
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except Exception as e:
+        logger.warning(f"Failed to connect to MJPEG stream at {url}: {e}")
+        return False, str(e)
+
+    logger.info(f"MJPEG stream connected: {url} (Content-Type: {resp.headers.get('Content-Type')})")
+    buf = b""
+    max_buf_size = 2 * 1024 * 1024  # 2 MB safety cap
+
+    try:
+        while not stop_event.is_set():
+            try:
+                chunk = resp.read(4096)
+                if not chunk:
+                    logger.warning("MJPEG stream EOF reached.")
+                    break
+                buf += chunk
+            except Exception as e:
+                logger.warning(f"Error reading chunk from {url}: {e}")
+                break
+
+            # Search and extract all complete JPEG frames in buffer
+            while True:
+                start_idx = buf.find(b"\xff\xd8")
+                if start_idx == -1:
+                    # No JPEG start marker; keep only last 2 bytes in case marker is split
+                    if len(buf) > 2:
+                        buf = buf[-2:]
+                    break
+
+                end_idx = buf.find(b"\xff\xd9", start_idx + 2)
+                if end_idx == -1:
+                    # Start found but waiting for complete end marker
+                    if start_idx > 0:
+                        buf = buf[start_idx:]  # Discard header/noise before start
+                    if len(buf) > max_buf_size:
+                        buf = buf[-4096:]  # Buffer overflow prevention
+                    break
+
+                # Full JPEG frame extracted
+                jpg_data = buf[start_idx : end_idx + 2]
+                buf = buf[end_idx + 2 :]
+
+                try:
+                    arr = np.frombuffer(jpg_data, dtype=np.uint8)
+                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if frame is not None and frame.size > 0:
+                        frame_callback(frame)
+                except Exception as decode_err:
+                    logger.debug(f"JPEG decode error: {decode_err}")
+
+    except Exception as outer_err:
+        logger.warning(f"MJPEG loop error: {outer_err}")
+        return False, str(outer_err)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+    return True, ""
+
+
+def _create_diagnostic_frame(room_name, source, status_msg):
+    """Generates an informative diagnostic canvas when a camera stream is offline."""
+    f = np.zeros((480, 854, 3), dtype=np.uint8) + 20
+    cv2.rectangle(f, (0, 0), (854, 45), (35, 35, 35), -1)
+    cv2.putText(f, f"{room_name.upper()}  —  {status_msg}", (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 240, 240), 2, cv2.LINE_AA)
+    
+    src_str = str(source)
+    if len(src_str) > 60:
+        src_str = src_str[:57] + "..."
+    cv2.putText(f, f"Source: {src_str}", (20, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 160, 160), 1, cv2.LINE_AA)
+    cv2.putText(f, f"Status: {status_msg}", (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2, cv2.LINE_AA)
+    cv2.putText(f, f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", (20, 180),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
+    cv2.putText(f, "Attempting continuous background connection...", (20, 440),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1, cv2.LINE_AA)
+    return f
+
+
+# ──────────────────────────────────────────────────────────
+# Single Shared Inference Dispatcher (One Model per Camera)
+# ──────────────────────────────────────────────────────────
+class InferenceDispatcher(threading.Thread):
+    def __init__(self, engine):
+        super().__init__(name="InferenceDispatcher", daemon=True)
+        self.engine = engine
+        self.stop_event = threading.Event()
+        self._slots = {}
+        self._lock = threading.Lock()
+
+    def submit(self, room_name, frame):
+        with self._lock:
+            self._slots[room_name] = frame
+
+    def run(self):
+        logger.info("InferenceDispatcher worker started.")
+        while not self.stop_event.is_set():
+            with self._lock:
+                pending = dict(self._slots)
+                self._slots.clear()
+
+            if not pending:
+                time.sleep(0.01)
+                continue
+
+            for room_name, frame in pending.items():
+                if self.stop_event.is_set():
+                    break
+
+                model = self.engine.models.get(room_name)
+                if model is None:
+                    continue
+
+                try:
+                    # Run YOLOv8 detection and tracking on dedicated per-room model
+                    results = model.track(
+                        source=frame,
+                        persist=True,
+                        conf=config.YOLO_CONF_THRESHOLD,
+                        classes=_TARGET_CLASSES,
+                        imgsz=_YOLO_IMGSZ,
+                        verbose=False
+                    )
+
+                    detections = []
+                    if results and len(results) > 0 and results[0].boxes is not None:
+                        boxes_obj = results[0].boxes
+                        if boxes_obj.cls is not None and len(boxes_obj.cls) > 0:
+                            boxes_xyxy = boxes_obj.xyxy.cpu().tolist()
+                            confs_list = boxes_obj.conf.cpu().tolist()
+                            clss_list = boxes_obj.cls.int().cpu().tolist()
+
+                            # Track IDs
+                            if boxes_obj.id is not None:
+                                ids_list = boxes_obj.id.int().cpu().tolist()
+                            else:
+                                # Fallback pseudo-IDs based on spatial grid hash
+                                ids_list = [
+                                    abs(hash((int(b[0]) // 30, int(b[1]) // 30, int(b[2]) // 30, int(b[3]) // 30, c))) % 8000 + 1000
+                                    for b, c in zip(boxes_xyxy, clss_list)
+                                ]
+
+                            for tid, box, conf, cls_id in zip(ids_list, boxes_xyxy, confs_list, clss_list):
+                                if cls_id in config.YOLO_CLASS_MAP:
+                                    detections.append({
+                                        "track_id": tid,
+                                        "name": config.YOLO_CLASS_MAP[cls_id],
+                                        "confidence": float(conf),
+                                        "bbox": box
+                                    })
+
+                    # Update tracker state machine
+                    self.engine.tracker.update(room_name, detections, frame)
+
+                except Exception as e:
+                    logger.error(f"Inference error on {room_name}: {e}")
+
+        logger.info("InferenceDispatcher stopped.")
+
+    def stop(self):
+        self.stop_event.set()
+
+
+# ──────────────────────────────────────────────────────────
+# Webcam Capture Worker
+# ──────────────────────────────────────────────────────────
+class WebcamWorker(threading.Thread):
+    def __init__(self, room_name, index, engine):
+        super().__init__(name=f"Webcam-{room_name}", daemon=True)
+        self.room_name = room_name
+        self.index = index
+        self.engine = engine
+        self.stop_event = threading.Event()
+        self.TARGET_FPS = 25
+
+    def run(self):
+        logger.info(f"[{self.room_name}] Webcam worker started (device index {self.index}).")
+        
+        while not self.stop_event.is_set() and self.engine.is_running:
+            cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(self.index)
+
+            if not cap.isOpened():
+                logger.warning(f"[{self.room_name}] Cannot open webcam index {self.index}.")
+                self.engine.set_raw_frame(self.room_name, _create_diagnostic_frame(self.room_name, self.index, "UNAVAILABLE"))
+                time.sleep(1.5)
+                continue
+
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            logger.info(f"[{self.room_name}] Webcam ready.")
+            frame_interval = 1.0 / self.TARGET_FPS
+
+            while not self.stop_event.is_set() and self.engine.is_running:
+                t0 = time.time()
+                ret, raw = cap.read()
+                if not ret or raw is None:
+                    logger.warning(f"[{self.room_name}] Frame grab failed. Reconnecting...")
+                    break
+
+                # Resize to standard stream resolution
+                frame = cv2.resize(raw, (config.STREAM_WIDTH, config.STREAM_HEIGHT))
+                self.engine.set_raw_frame(self.room_name, frame)
+                self.engine.dispatcher.submit(self.room_name, frame)
+
+                elapsed = time.time() - t0
+                sleep_t = max(0.0, frame_interval - elapsed)
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+            cap.release()
+            if not self.stop_event.is_set():
+                time.sleep(0.5)
+
+        logger.info(f"[{self.room_name}] Webcam worker stopped.")
+
+    def stop(self):
+        self.stop_event.set()
+
+
+# ──────────────────────────────────────────────────────────
+# ESP32-CAM Worker
+# ──────────────────────────────────────────────────────────
+class ESP32Worker(threading.Thread):
+    def __init__(self, room_name, url, engine):
+        super().__init__(name=f"ESP32-{room_name}", daemon=True)
+        self.room_name = room_name
+        self.url = url
+        self.engine = engine
+        self.stop_event = threading.Event()
+
+    def _on_frame(self, raw_frame):
+        frame = cv2.resize(raw_frame, (config.STREAM_WIDTH, config.STREAM_HEIGHT))
+        self.engine.set_raw_frame(self.room_name, frame)
+        self.engine.dispatcher.submit(self.room_name, frame)
+
+    def run(self):
+        logger.info(f"[{self.room_name}] ESP32 worker started: {self.url}")
+        
+        while not self.stop_event.is_set() and self.engine.is_running:
+            self.engine.set_raw_frame(self.room_name, _create_diagnostic_frame(self.room_name, self.url, "CONNECTING..."))
+            
+            # Read MJPEG stream with auto-reconnect
+            success, err = _read_mjpeg_stream(self.url, self._on_frame, self.stop_event, timeout=10.0)
+            
+            if not success and not self.stop_event.is_set():
+                self.engine.set_raw_frame(self.room_name, _create_diagnostic_frame(self.room_name, self.url, f"OFFLINE ({err[:35]})"))
+                time.sleep(2.0)
+
+        logger.info(f"[{self.room_name}] ESP32 worker stopped.")
+
+    def stop(self):
+        self.stop_event.set()
+
+
+# ──────────────────────────────────────────────────────────
+# VisionEngine Central Orchestrator
+# ──────────────────────────────────────────────────────────
 class VisionEngine:
     def __init__(self):
         self.tracker = StationaryTracker()
         self.is_running = False
-        self.latest_frames = {}  # Maps room_name -> cv2 frame
-        self.thread = None
-        self.lock = threading.Lock()
-        
-        # Load YOLO model safely
+
+        self.raw_frames = {}
+        self.frame_lock = threading.Lock()
+
+        self.camera_workers = {}
+        self.dispatcher = None
+        self.models = {}
         self.model = None
+
+        # Load YOLOv8 models (one instance per camera zone)
         try:
             from ultralytics import YOLO
             os.environ["YOLO_VERBOSE"] = "False"
-            self.model = YOLO(config.YOLO_MODEL_NAME)
-            logger.info("YOLOv8 model loaded successfully.")
+            dummy = np.zeros((_YOLO_IMGSZ, _YOLO_IMGSZ, 3), dtype=np.uint8)
+
+            for room_name in config.CAMERA_SOURCES:
+                m = YOLO(config.YOLO_MODEL_NAME)
+                # Model warm-up
+                m.track(source=dummy, persist=False, conf=0.9, classes=_TARGET_CLASSES, imgsz=_YOLO_IMGSZ, verbose=False)
+                self.models[room_name] = m
+                logger.info(f"YOLOv8 initialized for zone '{room_name}'.")
+
+            self.model = next(iter(self.models.values()), None)
         except Exception as e:
-            logger.warning(f"Could not load YOLOv8 model: {e}. Running in simulation mode.")
+            logger.error(f"Failed to load YOLO models: {e}")
 
-    def start(self):
-        """Starts the background vision processing thread."""
-        with self.lock:
-            if not self.is_running:
-                self.is_running = True
-                self.thread = threading.Thread(target=self.run, daemon=True)
-                self.thread.start()
-                logger.info("Vision Engine started in background.")
-
-    def stop(self):
-        """Stops the background vision processing thread."""
-        with self.lock:
-            if self.is_running:
-                self.is_running = False
-                if self.thread:
-                    self.thread.join(timeout=2.0)
-                logger.info("Vision Engine stopped.")
-
-    def _draw_room_background(self, room_name):
-        """Renders a beautiful 2D perspective interior for the room."""
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        
-        # Floor (Soft warm grey)
-        cv2.rectangle(frame, (0, 240), (640, 480), (220, 215, 210), -1)
-        
-        # Walls (Soft blue-grey wallpaper)
-        cv2.rectangle(frame, (0, 0), (640, 240), (145, 130, 115), -1)
-        
-        # Wall baseboard separator
-        cv2.line(frame, (0, 240), (640, 240), (90, 80, 75), 3)
-
-        if room_name == "Living Room":
-            # Draw Rug (Warm beige oval)
-            cv2.ellipse(frame, (320, 380), (260, 80), 0, 0, 360, (180, 190, 205), -1)
-            cv2.ellipse(frame, (320, 380), (260, 80), 0, 0, 360, (140, 150, 165), 2)
-            
-            # Sofa (Brown wood base, orange/brown cushions)
-            # Base board
-            cv2.rectangle(frame, (100, 350), (540, 430), (50, 65, 85), -1)
-            # Backrest cushions
-            cv2.rectangle(frame, (120, 270), (250, 350), (70, 90, 120), -1)
-            cv2.rectangle(frame, (250, 270), (380, 350), (70, 90, 120), -1)
-            cv2.rectangle(frame, (380, 270), (510, 350), (70, 90, 120), -1)
-            # Armrests
-            cv2.rectangle(frame, (80, 310), (120, 430), (50, 65, 85), -1)
-            cv2.rectangle(frame, (510, 310), (550, 430), (50, 65, 85), -1)
-            # Seat cushions
-            cv2.rectangle(frame, (120, 350), (250, 420), (85, 110, 145), -1)
-            cv2.rectangle(frame, (250, 350), (380, 420), (85, 110, 145), -1)
-            cv2.rectangle(frame, (380, 350), (510, 420), (85, 110, 145), -1)
-            
-            # Draw Table (Brown wood table)
-            # Legs
-            cv2.rectangle(frame, (220, 250), (235, 310), (50, 50, 50), -1)
-            cv2.rectangle(frame, (400, 250), (415, 310), (50, 50, 50), -1)
-            # Tabletop
-            cv2.rectangle(frame, (180, 240), (450, 255), (40, 70, 110), -1)
-            
-            # Wall art/painting
-            cv2.rectangle(frame, (260, 60), (380, 150), (60, 130, 80), -1)
-            cv2.rectangle(frame, (260, 60), (380, 150), (40, 50, 60), 3) # Frame
-            cv2.circle(frame, (320, 105), 15, (0, 230, 255), -1) # Sun
-            cv2.line(frame, (265, 145), (320, 115), (50, 90, 60), 2) # Hill
-            cv2.line(frame, (375, 145), (320, 115), (50, 90, 60), 2)
-            
-        elif room_name == "Bedroom":
-            # Draw Window (with outdoor sky view)
-            cv2.rectangle(frame, (450, 40), (580, 180), (255, 235, 180), -1) # Wall window light
-            cv2.rectangle(frame, (460, 50), (570, 170), (250, 180, 100), -1) # Sky color
-            cv2.line(frame, (515, 50), (515, 170), (255, 235, 180), 2)
-            cv2.line(frame, (460, 110), (570, 110), (255, 235, 180), 2)
-            
-            # Draw Bed (Teal comforter, white pillows)
-            # Frame base
-            cv2.rectangle(frame, (60, 220), (340, 460), (50, 50, 60), -1)
-            # Mattress / Sheets
-            cv2.rectangle(frame, (80, 240), (340, 450), (240, 240, 245), -1)
-            # Pillows
-            cv2.rectangle(frame, (90, 250), (140, 330), (220, 220, 220), -1)
-            cv2.rectangle(frame, (90, 350), (140, 430), (220, 220, 220), -1)
-            # Quilt/Blanket
-            cv2.rectangle(frame, (150, 240), (340, 450), (140, 110, 70), -1)
-            
-            # Draw Desk
-            # Legs
-            cv2.rectangle(frame, (410, 270), (425, 390), (40, 40, 40), -1)
-            cv2.rectangle(frame, (570, 270), (585, 390), (40, 40, 40), -1)
-            # Desktop
-            cv2.rectangle(frame, (380, 260), (600, 275), (45, 80, 120), -1)
-            
-        return frame
-
-    def _draw_cup(self, frame, x, y):
-        """Draws a stylized blue coffee cup."""
-        # Body
-        cv2.rectangle(frame, (x - 12, y - 16), (x + 12, y + 16), (200, 110, 45), -1)
-        # Handle
-        cv2.ellipse(frame, (x + 12, y), (8, 10), 0, 270, 90, (200, 110, 45), 3)
-        # Rim
-        cv2.ellipse(frame, (x, y - 16), (12, 3), 0, 0, 360, (235, 175, 140), -1)
-
-    def _draw_phone(self, frame, x, y):
-        """Draws a stylized smartphone with a glowing wallpaper."""
-        # Phone body
-        cv2.rectangle(frame, (x - 12, y - 20), (x + 12, y + 20), (30, 30, 30), -1)
-        # Screen glow
-        cv2.rectangle(frame, (x - 10, y - 18), (x + 10, y + 18), (250, 220, 80), -1)
-        # Screen wallpaper details
-        cv2.circle(frame, (x, y - 5), 6, (180, 100, 50), -1)
-        cv2.line(frame, (x - 10, y + 10), (x + 10, y + 10), (255, 255, 255), 1)
-        # Speaker notch
-        cv2.line(frame, (x - 4, y - 19), (x + 4, y - 19), (0, 0, 0), 1)
-
-    def _draw_laptop(self, frame, x, y):
-        """Draws an open silver laptop."""
-        # Base
-        cv2.rectangle(frame, (x - 35, y), (x + 35, y + 6), (200, 200, 205), -1)
-        # Trackpad
-        cv2.rectangle(frame, (x - 10, y), (x + 10, y + 3), (160, 160, 165), -1)
-        # Screen lid
-        cv2.rectangle(frame, (x - 30, y - 40), (x + 30, y), (80, 80, 80), -1)
-        # Screen panel
-        cv2.rectangle(frame, (x - 27, y - 37), (x + 27, y - 3), (150, 80, 50), -1)
-        # Simulated code lines on screen
-        cv2.line(frame, (x - 20, y - 30), (x - 5, y - 30), (255, 255, 255), 2)
-        cv2.line(frame, (x - 20, y - 24), (x - 10, y - 24), (0, 255, 255), 2)
-        cv2.line(frame, (x - 20, y - 18), (x, y - 18), (0, 255, 0), 2)
-
-    def _draw_book(self, frame, x, y):
-        """Draws a stacked pile of colorful books."""
-        # Book 1 (Red)
-        cv2.rectangle(frame, (x - 22, y + 4), (x + 22, y + 12), (70, 70, 210), -1)
-        cv2.rectangle(frame, (x - 20, y + 4), (x + 22, y + 12), (240, 240, 240), 1) # Pages spine
-        # Book 2 (Green)
-        cv2.rectangle(frame, (x - 18, y - 4), (x + 18, y + 3), (70, 160, 70), -1)
-        cv2.rectangle(frame, (x - 16, y - 4), (x + 18, y + 3), (240, 240, 240), 1)
-        # Book 3 (Orange)
-        cv2.rectangle(frame, (x - 15, y - 12), (x + 15, y - 5), (60, 120, 210), -1)
-        cv2.rectangle(frame, (x - 13, y - 12), (x + 15, y - 5), (240, 240, 240), 1)
-
-    def generate_synthetic_frame(self, room_name, t):
-        """Generates a high-fidelity room frame and maps moving objects."""
-        # 1. Draw static room layout
-        frame = self._draw_room_background(room_name)
-        
-        # 60-second animation loop
-        cycle = t % 60.0
-        detections = []
-
-        if room_name == "Living Room":
-            # 1. Cup: Always stationary on table
-            cx_cup, cy_cup = 260, 225
-            self._draw_cup(frame, cx_cup, cy_cup)
-            detections.append({
-                'track_id': 1,
-                'name': 'cup',
-                'confidence': 0.94,
-                'bbox': [cx_cup - 15, cy_cup - 20, cx_cup + 15, cy_cup + 20]
-            })
-
-            # 2. Phone physics path
-            # - 0s to 10s: stationary on table
-            # - 10s to 16s: sliding to sofa
-            # - 16s to 25s: stationary on sofa
-            # - 25s to 30s: sliding off-screen right
-            # - 30s to 55s: off-screen
-            # - 55s to 60s: sliding back to table
-            cx, cy = None, None
-            if 0.0 <= cycle < 10.0:
-                cx, cy = 340, 225
-            elif 10.0 <= cycle < 16.0:
-                p = (cycle - 10.0) / 6.0
-                cx = 340.0 + p * (450.0 - 340.0)
-                cy = 225.0 + p * (380.0 - 225.0)
-            elif 16.0 <= cycle < 25.0:
-                cx, cy = 450, 380
-            elif 25.0 <= cycle < 30.0:
-                p = (cycle - 25.0) / 5.0
-                cx = 450.0 + p * 250.0  # 450 to 700
-                cy = 380.0 - p * 30.0   # 380 to 350
-            elif 30.0 <= cycle < 55.0:
-                cx, cy = None, None
-            else:  # 55.0 to 60.0
-                p = (cycle - 55.0) / 5.0
-                cx = 700.0 - p * 360.0  # 700 to 340
-                cy = 350.0 - p * 125.0  # 350 to 225
-
-            if cx is not None and cy is not None and (0 <= cx <= 640):
-                self._draw_phone(frame, int(cx), int(cy))
-                detections.append({
-                    'track_id': 2,
-                    'name': 'phone',
-                    'confidence': 0.91,
-                    'bbox': [cx - 15, cy - 20, cx + 15, cy + 20]
-                })
-
-        elif room_name == "Bedroom":
-            # 1. Laptop: Stationary on table
-            cx_lap, cy_lap = 490, 235
-            self._draw_laptop(frame, cx_lap, cy_lap)
-            detections.append({
-                'track_id': 3,
-                'name': 'laptop',
-                'confidence': 0.96,
-                'bbox': [cx_lap - 35, cy_lap - 25, cx_lap + 35, cy_lap + 10]
-            })
-
-            # 2. Book: Stationary on Bed
-            cx_bk, cy_bk = 160, 300
-            self._draw_book(frame, cx_bk, cy_bk)
-            detections.append({
-                'track_id': 4,
-                'name': 'book',
-                'confidence': 0.88,
-                'bbox': [cx_bk - 25, cy_bk - 20, cx_bk + 25, cy_bk + 20]
-            })
-
-            # 3. Phone (displaced from Living Room)
-            # - 0s to 29s: off-screen
-            # - 29s to 34s: entering from left to bed cushion
-            # - 34s to 42s: stationary on Bed
-            # - 42s to 48s: sliding to desk
-            # - 48s to 56s: stationary on desk
-            # - 56s to 60s: sliding off-screen left
-            cx, cy = None, None
-            if 29.0 <= cycle < 34.0:
-                p = (cycle - 29.0) / 5.0
-                cx = -50.0 + p * 270.0  # -50 to 220
-                cy = 300.0 + p * 20.0   # 300 to 320
-            elif 34.0 <= cycle < 42.0:
-                cx, cy = 220, 320
-            elif 42.0 <= cycle < 48.0:
-                p = (cycle - 42.0) / 6.0
-                cx = 220.0 + p * 210.0  # 220 to 430
-                cy = 320.0 - p * 75.0   # 320 to 245
-            elif 48.0 <= cycle < 56.0:
-                cx, cy = 430, 245
-            elif 56.0 <= cycle < 60.0:
-                p = (cycle - 56.0) / 4.0
-                cx = 430.0 - p * 490.0  # 430 to -60
-                cy = 245.0 + p * 55.0   # 245 to 300
-
-            if cx is not None and cy is not None and (0 <= cx <= 640):
-                self._draw_phone(frame, int(cx), int(cy))
-                detections.append({
-                    # Track ID matches the Living Room source logic to show multi-camera sequence
-                    'track_id': 20, 
-                    'name': 'phone',
-                    'confidence': 0.89,
-                    'bbox': [cx - 15, cy - 20, cx + 15, cy + 20]
-                })
-
-        return frame, detections
-
-    def process_camera(self, room_name, source):
-        """Processes a camera feed and draws active tracks and trail indicators."""
-        frame = None
-        detections = []
-        is_simulated = True
-
-        # Try to load actual video feed
-        if isinstance(source, str) and os.path.exists(source):
-            is_simulated = False
-        elif isinstance(source, int):
-            is_simulated = False
-
-        if not is_simulated and self.model is not None:
-            cap = cv2.VideoCapture(source)
-            if cap.isOpened():
-                ret, raw_frame = cap.read()
-                if ret:
-                    frame = raw_frame
-                    frame = cv2.resize(frame, (640, 480))
-                    
-                    results = self.model.track(
-                        source=frame,
-                        persist=True,
-                        conf=config.YOLO_CONF_THRESHOLD,
-                        verbose=False
-                    )
-                    
-                    if results and results[0].boxes is not None and results[0].boxes.id is not None:
-                        ids = results[0].boxes.id.int().cpu().tolist()
-                        boxes = results[0].boxes.xyxy.cpu().tolist()
-                        confs = results[0].boxes.conf.cpu().tolist()
-                        clss = results[0].boxes.cls.int().cpu().tolist()
-                        
-                        for track_id, box, conf, cls_id in zip(ids, boxes, confs, clss):
-                            if cls_id in config.YOLO_CLASS_MAP:
-                                detections.append({
-                                    'track_id': track_id,
-                                    'name': config.YOLO_CLASS_MAP[cls_id],
-                                    'confidence': conf,
-                                    'bbox': box
-                                })
-                cap.release()
-            else:
-                is_simulated = True
-
-        if is_simulated:
-            frame, detections = self.generate_synthetic_frame(room_name, time.time())
-
-        # Feed to stationary tracker
-        if frame is not None:
-            self.tracker.update(room_name, detections, frame)
-            
-            # Draw tracks, boxes, and history trails
-            active_room_tracks = self.tracker.active_tracks.get(room_name, {})
-            for track_id, state in active_room_tracks.items():
-                x1, y1, x2, y2 = map(int, state.bbox)
-                
-                if state.status == 'stationary':
-                    color = (50, 220, 50)     # Green
-                elif state.status == 'tracking':
-                    color = (0, 140, 255)     # Orange/Yellow
-                else:
-                    color = (50, 50, 220)     # Red
-                
-                # DRAW CENTROID HISTORICAL TRAIL
-                trail = state.centroid_history
-                if len(trail) > 1:
-                    for i in range(1, len(trail)):
-                        pt1 = (int(trail[i-1][1]), int(trail[i-1][2]))
-                        pt2 = (int(trail[i][1]), int(trail[i][2]))
-                        # Draw fade trail lines
-                        thickness = int(1 + (i / len(trail)) * 3)
-                        cv2.line(frame, pt1, pt2, (0, 140, 255), thickness)
-                        # Draw dots along path
-                        if i == len(trail) - 1:
-                            cv2.circle(frame, pt2, 4, (0, 220, 255), -1)
-
-                # Draw bounding box outline
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                # Draw dynamic classification card
-                label = f"{state.object_name.upper()} #{track_id} ({state.status.upper()})"
-                cv2.rectangle(frame, (x1 - 1, y1 - 20), (x1 + 180, y1), color, -1)
-                cv2.putText(frame, label, (x1 + 4, y1 - 5), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-            with self.lock:
-                self.latest_frames[room_name] = frame
-
-    def run(self):
-        """Processes frames continuously at ~10 FPS."""
-        logger.info("Vision loop entered.")
-        while self.is_running:
-            start_time = time.time()
-            for room_name, source in config.CAMERA_SOURCES.items():
-                try:
-                    self.process_camera(room_name, source)
-                except Exception as e:
-                    logger.error(f"Error processing room {room_name}: {e}")
-                    
-            elapsed = time.time() - start_time
-            sleep_time = max(0.01, 0.1 - elapsed)
-            time.sleep(sleep_time)
-        logger.info("Vision loop exited.")
+    def set_raw_frame(self, room_name, frame):
+        with self.frame_lock:
+            self.raw_frames[room_name] = frame
 
     def get_latest_frame(self, room_name):
-        """Thread-safely gets the latest frame for a room."""
-        with self.lock:
-            return self.latest_frames.get(room_name)
+        """
+        Returns the latest camera frame with real-time bounding boxes, trails,
+        and status badges rendered directly on top.
+        """
+        with self.frame_lock:
+            raw = self.raw_frames.get(room_name)
+            if raw is None:
+                return None
+            frame = raw.copy()
+
+        # Render overlays directly on frame
+        active_tracks = self.tracker.active_tracks.get(room_name, {})
+        for tid, state in active_tracks.items():
+            x1, y1, x2, y2 = map(int, state.bbox)
+
+            # Color scheme: Green = Stationary, Orange = Tracking/Moving, Red = Lost
+            if state.status == "stationary":
+                color = (45, 215, 45)      # Vibrant Green
+                badge_text = "STATIONARY"
+            elif state.status == "tracking":
+                color = (0, 165, 255)       # Amber / Orange
+                badge_text = "TRACKING"
+            else:
+                color = (50, 50, 220)       # Red
+                badge_text = "LOST"
+
+            # 1. Centroid Motion Trail
+            trail = state.centroid_history
+            for i in range(1, len(trail)):
+                p1 = (int(trail[i - 1][1]), int(trail[i - 1][2]))
+                p2 = (int(trail[i][1]), int(trail[i][2]))
+                thickness = max(1, int(1 + (i / len(trail)) * 2))
+                cv2.line(frame, p1, p2, (0, 140, 255), thickness)
+            if trail:
+                cv2.circle(frame, (int(trail[-1][1]), int(trail[-1][2])), 5, (0, 220, 255), -1)
+
+            # 2. Bounding Box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # 3. Label Badge Header
+            label = f"{state.object_name.upper()} #{tid} [{badge_text}] {state.confidence * 100:.0f}%"
+            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+            ty = max(0, y1 - lh - 6)
+            cv2.rectangle(frame, (x1, ty), (x1 + lw + 6, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 3, max(12, y1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Zone Header Banner
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 28), (0, 0, 0), -1)
+        cv2.circle(frame, (12, 14), 5, (0, 255, 0), -1)
+        cv2.putText(frame, f"{room_name.upper()}  |  LIVE", (26, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+
+        return frame
+
+    def start(self):
+        if self.is_running:
+            return
+        self.is_running = True
+
+        # Start single inference dispatcher
+        self.dispatcher = InferenceDispatcher(self)
+        self.dispatcher.start()
+
+        # Start capture workers
+        for room_name, source in config.CAMERA_SOURCES.items():
+            if isinstance(source, int):
+                w = WebcamWorker(room_name, source, self)
+            else:
+                w = ESP32Worker(room_name, source, self)
+            w.start()
+            self.camera_workers[room_name] = w
+
+        logger.info("VisionEngine started successfully.")
+
+    def stop(self):
+        if not self.is_running:
+            return
+        self.is_running = False
+
+        if self.dispatcher:
+            self.dispatcher.stop()
+        for w in self.camera_workers.values():
+            w.stop()
+
+        if self.dispatcher and self.dispatcher.is_alive():
+            self.dispatcher.join(timeout=2.0)
+        for w in self.camera_workers.values():
+            if w.is_alive():
+                w.join(timeout=2.0)
+
+        self.camera_workers.clear()
+        self.dispatcher = None
+        logger.info("VisionEngine stopped.")

@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-dark-900 text-slate-100 min-h-screen antialiased selection:bg-neon-blue/30 selection:text-neon-blue;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Custom glassmorphism and modern UI helpers */
+.glass-panel {
+  background: rgba(14, 18, 26, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+.glass-panel-hover {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.glass-panel-hover:hover {
+  background: rgba(21, 27, 38, 0.85);
+  border-color: rgba(0, 210, 255, 0.25);
+  box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.5), 0 0 20px -5px rgba(0, 210, 255, 0.15);
+}
+
+.glass-card {
+  background: linear-gradient(135deg, rgba(21, 27, 38, 0.7) 0%, rgba(14, 18, 26, 0.9) 100%);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* Custom dark scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #07090e;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e2636;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2a344a;
+}
+
+/* ── Animations ─────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0);    }
+}
+
+@keyframes pulseNeon {
+  0%, 100% { box-shadow: 0 0 6px rgba(0, 210, 255, 0.4); }
+  50%       { box-shadow: 0 0 20px rgba(0, 210, 255, 0.8); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position:  200% center; }
+}
+
+.animate-fadeIn  { animation: fadeIn  0.3s ease-out both; }
+.animate-slideUp { animation: slideUp 0.4s ease-out both; }
+.animate-pulse-neon { animation: pulseNeon 2s ease-in-out infinite; }
+
+/* ── Neon glow borders ──────────────────────────────────── */
+.border-neon { border: 1px solid rgba(0, 210, 255, 0.35); }
+.ring-neon   { box-shadow: 0 0 0 2px rgba(0, 210, 255, 0.4); }
+
+/* ── Loading shimmer ────────────────────────────────────── */
+.shimmer {
+  background: linear-gradient(90deg,
+    rgba(255,255,255,0.03) 25%,
+    rgba(255,255,255,0.08) 50%,
+    rgba(255,255,255,0.03) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite;
+}

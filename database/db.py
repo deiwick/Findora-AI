@@ -87,7 +87,7 @@ def get_object_history(object_name):
     cursor = conn.cursor()
     
     cursor.execute("""
-        SELECT room_name, timestamp, status, confidence, bbox, thumbnail_path, track_id
+        SELECT id, object_name, room_name, timestamp, status, confidence, bbox, thumbnail_path, track_id
         FROM findora_memory
         WHERE object_name = ?
         ORDER BY timestamp DESC
